@@ -1025,6 +1025,46 @@ done:
     return ret;
 }
 
+/*
+ * Prepare the Codec DMA devices of a session at session prepare instead of
+ * session start. The ALSA prepare of the backend powers up the codec path
+ * (SoundWire, codec macro, DAPM) and takes several ms; done in
+ * session_start() after graph_start(), it delays every session started after
+ * this one, so a playback and a capture session started back to back reach
+ * the DSP ~10 ms apart. session_start() only starts aifs that are already
+ * AIF_PREPARED. Caller holds hwep_lock.
+ */
+static int session_prepare_codec_dma_devices(struct session_obj *sess_obj)
+{
+    int ret = 0;
+    struct aif *aif_obj = NULL;
+    struct listnode *node = NULL;
+
+    list_for_each(node, &sess_obj->aif_pool) {
+        aif_obj = node_to_item(node, struct aif, node);
+        if (!aif_obj || !aif_obj->dev_obj)
+            continue;
+
+        if (aif_obj->state != AIF_OPENED && aif_obj->state != AIF_STOPPED)
+            continue;
+
+        if (aif_obj->dev_obj->hw_ep_info.intf != CODEC_DMA)
+            continue;
+
+        agm_trace_begin("device_prepare");
+        ret = device_prepare(aif_obj->dev_obj);
+        agm_trace_end();
+        if (ret) {
+            AGM_LOGE("Error:%d preparing device id:%d\n",
+                     ret, aif_obj->aif_id);
+            break;
+        }
+        aif_obj->state = AIF_PREPARED;
+    }
+
+    return ret;
+}
+
 static int session_prepare(struct session_obj *sess_obj)
 {
     int ret = 0;
@@ -1059,14 +1099,19 @@ static int session_prepare(struct session_obj *sess_obj)
             agm_trace_begin("graph_prepare");
             ret = graph_prepare(sess_obj->graph);
             agm_trace_end();
-            pthread_mutex_unlock(&hwep_lock);
             if (ret) {
+                pthread_mutex_unlock(&hwep_lock);
                 AGM_LOGE("Error:%d preparing graph\n", ret);
                 goto done;
-            } else {
-                sess_obj->state = SESSION_PREPARED;
-                sess_obj->bytes_written = 0;
             }
+
+            ret = session_prepare_codec_dma_devices(sess_obj);
+            pthread_mutex_unlock(&hwep_lock);
+            if (ret)
+                goto done;
+
+            sess_obj->state = SESSION_PREPARED;
+            sess_obj->bytes_written = 0;
         }
     } else if(sess_obj->state != SESSION_STARTED) {
         agm_trace_begin("graph_prepare");
